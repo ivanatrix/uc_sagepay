@@ -1,0 +1,329 @@
+<?php
+// Simulator, Test and live Sagepay Server transaction notification URL's
+define(uc_sagepay_SIMULATOR_URL, 'https://test.sagepay.com/Simulator/VSPServerGateway.asp?Service=VendorRegisterTx');
+define(uc_sagepay_TEST_URL, 'https://test.sagepay.com/gateway/service/vspserver-register.vsp');
+define(uc_sagepay_LIVE_URL, 'https://live.sagepay.com/gateway/service/vspserver-register.vsp');
+
+function uc_sagepay_init() {
+  // If the form is checkout review and we have an error flag, display the relevant error
+  if (isset($_GET['uc_sagepay_error'])) {
+    switch ($_GET['uc_sagepay_error']) {
+      case 'notauthed':
+          // Authorisation was failed by the bank
+          drupal_set_message(t('You payment was declined by the bank. This could be due to insufficient funds, or incorrect card details. If the problem persists, contact your bank.'), 'error');
+        break;
+      case 'error':
+          // An error has occurred at Sage Pay ... they normally indicate a problem with bank connectivity
+          drupal_set_message(t('We could not process your order because our Payment Gateway service was experiencing difficulties. Please contact us for assistance.'), 'error');
+        break;
+      case 'rejected':
+          // Fraud screening rules were not met
+          drupal_set_message(t('Your order did not meet our minimum fraud screening requirements. If you have questions about our fraud screening rules, or wish to discuss this, please contact us.'), 'error');
+        break;
+    }
+  }
+  else {
+    drupal_get_messages('error', TRUE);
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ * Add items to Drupal's menu system
+ */
+function uc_sagepay_menu() {
+  // URL for Sagepay Server to send it's notifications to
+  $items['uc_sagepay/%/notification/%'] = array(
+    'title' => 'Sagepay Server Notification',
+    'page callback' => 'uc_sagepay_notification',
+    'page arguments' => array(1, 3),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_sagepay.pages.inc'
+  );
+  // URL for user to be directed to on order completion
+  $items['order/%/thankyou'] = array(
+    'title' => 'Thankyou for your order',
+    'page callback' => 'uc_sagepay_order_thankyou',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_sagepay.pages.inc'
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_payment_method().
+ *
+ * Add config form to Ubercart Payment Methods administration page
+ */
+function uc_sagepay_payment_method() {
+  $methods[] = array(
+    'id' => 'uc_sagepay',
+    'name' => t('Sagepay Server'),
+    'title' => t('Sagepay Server'),
+    'description' => t('Pay using Sagepay Server.'),
+    'callback' => 'uc_payment_method_sagepayserver',
+    'checkout' => FALSE,
+    'weight' => 1,
+  );
+  return $methods;
+}
+
+/**
+ * Callback for hook_payment_method (see uc_sagepay_payment_method)
+ */
+function uc_payment_method_sagepayserver($op) {
+  switch ($op) {
+    case 'settings':
+      $form['uc_payment_method_sagepayserver']['uc_sagepay_mode'] = array(
+        '#type' => 'radios',
+        '#title' => t('Transaction registration mode'),
+        '#description' => t('Choose between simulator, test and live modes. When using the live mode, actual transactions will take place.'),
+        '#required' => TRUE,
+        '#default_value' => variable_get('uc_sagepay_mode', 0),
+        '#options' => array(t('Simulator'), t('Test'), t('Live')),
+      );
+      $form['uc_payment_method_sagepayserver']['uc_sagepay_vendor_name'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Vendor name'),
+        '#description' => t('This should contain the vendor name supplied by Sagepay when your account was created.'),
+        '#required' => TRUE,
+        '#default_value' => variable_get('uc_sagepay_vendor_name', NULL),
+      );
+      $form['uc_payment_method_sagepayserver']['uc_sagepay_debug_notifications'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Show debug info in the logs for payment notifications.'),
+        '#default_value' => variable_get('uc_sagepay_debug_notifications', FALSE),
+      );
+      return $form;
+  }
+}
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function uc_sagepay_form_alter(&$form, &$form_state, $form_id) {
+  // Add required stuff to the Ubercart order review form
+  if ($form_id == 'uc_cart_checkout_review_form' && ($order_id = intval($_SESSION['cart_order'])) > 0) {
+    $order = uc_order_load($order_id);
+    // If uc_sagepay is the selected method ...
+    if ($order->payment_method == 'uc_sagepay') {
+      // ... alter the checkout form to integrate with uc_sagepay
+      // Point the form at the processing URL
+      $form['#submit'] = array('uc_sagepay_checkout_form_submit');
+    }
+  }
+}
+
+/**
+ * Intercept the checkout form submission, send data to Sagepay, and respond to returned data
+ */
+function uc_sagepay_checkout_form_submit($form, &$form_state) {
+
+  global $user;
+  global $base_url;
+  
+  // Get order details
+  $order = uc_order_load($_SESSION['cart_order']);
+  
+  // Generate a unique vendor_tx_code
+  $vendor_tx_code = "AUTH-" . (rand(0, 32000)*rand(0, 32000)) . "-" . $order->order_id;
+  
+  // Get billing country code
+  $country_data = uc_get_country_data(array('country_id' => $order->billing_country));
+  $billing_country_iso_code = $country_data[0]["country_iso_code_2"];
+  
+  // If delivery country was specified, get the code
+  if ($order->delivery_country) {
+    $country_data = uc_get_country_data(array('country_id' => $order->delivery_country));
+    $delivery_country_iso_code = $country_data[0]["country_iso_code_2"];
+  }
+  // Otherwise just use billing country code
+  else {
+    $delivery_country_iso_code = $billing_country_iso_code;
+  }
+  
+  // Set description
+  $description = _uc_sagepay_make_order_description($order);
+  // Set basket
+  $basket = _uc_sagepay_make_order_basket($order);
+  // Set data to be sent to processor
+  // Sagepay requires delivery fields, so we have to provide them even if the product is not a deliverable
+  // When no delivery fields are provided in the order, use the billing fields instead
+  $nvp_request = array(
+    // Merchant Information
+    'VPSProtocol' => '3.00',
+    'TxType' => 'DEFERRED',
+    'Vendor' => variable_get('uc_sagepay_vendor_name', NULL),
+    'VendorTxCode' => $vendor_tx_code,
+    'Amount' => number_format(check_plain($order->order_total, "number"), 2, '.', ''),
+    'Currency' => variable_get('uc_currency_code', 'USD'),
+    'Description' => check_plain($description),
+    'BillingSurname' => check_plain($order->billing_last_name),
+    'BillingFirstnames' => check_plain($order->billing_first_name),
+    'BillingAddress1' => check_plain($order->billing_street1),
+    'BillingAddress2' => check_plain($order->billing_street2),
+    'BillingCity' => check_plain($order->billing_city),
+    'BillingPostcode' => check_plain($order->billing_postal_code),
+    'BillingCountry' => check_plain($billing_country_iso_code),
+    'BillingPhone' => check_plain($order->billing_phone),
+    'DeliverySurname' => (empty($order->delivery_last_name)) ? check_plain($order->billing_last_name) : check_plain($order->delivery_last_name),
+    'DeliveryFirstnames' => (empty($order->delivery_first_name)) ? check_plain($order->billing_first_name) : check_plain($order->delivery_first_name),
+    'DeliveryAddress1' => (empty($order->delivery_street1)) ? check_plain($order->billing_street1) : check_plain($order->delivery_street1),
+    'DeliveryAddress2' => (empty($order->delivery_street2)) ? check_plain($order->billing_street2) : check_plain($order->delivery_street2),
+    'DeliveryCity' => (empty($order->delivery_city)) ? check_plain($order->billing_city) : check_plain($order->delivery_city),
+    'DeliveryCountry' => check_plain($delivery_country_iso_code),
+    'DeliveryPostcode' => (empty($order->delivery_postal_code)) ? check_plain($order->billing_postal_code) : check_plain($order->delivery_postal_code),
+    // 'Basket' => check_plain($basket),
+    'NotificationURL' => url('uc_sagepay/' . $order->order_id . '/notification/' . uc_cart_get_id(), array('absolute' => TRUE))
+  );
+  
+  // Only provide BillingState and DeliveryState fields if country is US
+  if ($billing_country_iso_code == 'US') {
+    // Get billing state code
+    if ($order->billing_zone) {
+      $nvp_request['BillingState'] = uc_get_zone_code(intval($order->billing_zone));
+    }
+    // Get delivery state code, if state was provided and is US
+    if ($order->delivery_zone) {
+      $nvp_request['DeliveryState'] = uc_get_zone_code(intval($order->delivery_zone));
+    }
+    // Otherwise, use billing state code
+    else {
+      $nvp_request['DeliveryState'] = uc_get_zone_code(intval($order->billing_zone));
+    }
+  }
+
+  // Should the data be sent to the simulator, test or the live transaction notification url?
+  switch (variable_get('uc_sagepay_mode', 0)) {
+    case 0:
+        $registration_url = uc_sagepay_SIMULATOR_URL;
+      break;
+    case 1:
+        $registration_url = uc_sagepay_TEST_URL;
+      break;
+    case 2:
+        $registration_url = uc_sagepay_LIVE_URL;
+      break;
+    default:
+        $registration_url = uc_sagepay_SIMULATOR_URL;
+      break;
+  }
+  // Send the data to the processor and await response
+  $nvp_response = uc_sagepay_request($nvp_request, $registration_url, NULL);
+  
+  // Check for drupal_http_request errors
+  if (isset($nvp_response->error)) {
+    form_set_error('', t('There was an error processing the purchase. Please contact us.'));
+    watchdog('uc_sagepay', "Drupal had a problem sending order data to Sagepay Server. drupal_http_request() failed.<br />Error Code: @code<br />Error Message: @error", array('@code' => $nvp_response->code, '@error' => $nvp_response->error), WATCHDOG_ERROR);
+    return;
+  }
+  
+  if (!$nvp_response->data || empty($nvp_response->data)) {
+    form_set_error('', t('There was an error processing the purchase. Please contact us.'));
+    watchdog('uc_sagepay', 'No data returned from Sagepay Server notification URL', array(), WATCHDOG_NOTICE);
+    uc_order_update_status($order, 'in_checkout');
+    return;
+  }
+  
+  // Turn the response data string into a convenient array
+  $nvp_response_data = _uc_sagepay_response_to_array($nvp_response->data);
+  
+  // Check the response and take the appropriate action
+  // VPSProtocol
+  if ($nvp_response_data['VPSProtocol'] != '3.00') {
+    form_set_error('', t('There was an error processing the purchase. Please contact us.'));
+    watchdog('uc_sagepay', 'The VPSProtocol returned from Sagepay Server does not match the VPSProtocol of the notification data', array(), WATCHDOG_NOTICE);
+    uc_order_update_status($order, 'in_checkout');
+    return;
+  }
+  // Status
+  if ($nvp_response_data['Status'] == 'OK' || $nvp_response_data['Status'] == 'OKREPEATED') {
+    /**
+     * If status is okay set an appropriate status for the order (uc_sagepay pending?)
+     * and store the Security Key, NextURL and VPSTxId with the orderId
+     */
+    // Set the order status
+    uc_order_update_status($order, 'uc_sagepay_pending_results');    
+    // Record data in uc_sagepay_transactions table
+    $data = new stdClass();
+    $data->order_id = $order->order_id;
+    $data->vendor_transaction_code = $vendor_tx_code;
+    $data->uc_sagepay_transaction_id = $nvp_response_data['VPSTxId'];
+    $data->status = $nvp_response_data['Status'];
+    $data->status_detail = $nvp_response_data['StatusDetail'];
+    $data->security_key = $nvp_response_data['SecurityKey'];
+    $data->received = time();
+    drupal_write_record('uc_sagepay_transactions', $data);    
+    header('Location: ' . $nvp_response_data['NextURL']);
+    module_invoke_all('exit');
+    exit();
+  }
+  else {
+    // Log status detail
+    watchdog('uc_sagepay', $nvp_response_data['StatusDetail'], NULL, WATCHDOG_ERROR);
+    form_set_error('', t('There was an error processing the purchase. Please contact us.'));
+    watchdog('uc_sagepay', 'Sagepay Server sent a not OK response.@debug', array('@debug' => variable_get('uc_sagepay_debug_notifications', FALSE) ? print_r($nvp_response_data, TRUE) : ''), WATCHDOG_NOTICE);
+    uc_order_update_status($order, 'in_checkout');
+    return;
+  }
+  return;
+}
+
+// Sends a request to remote server and return a response array.
+function uc_sagepay_request($request, $server) {
+  $data = http_build_query($request, NULL, '&');
+  $headers = array('Content-Type' => 'application/x-www-form-urlencoded');  
+  $response = drupal_http_request($server, $headers, 'POST', $data);
+  return $response;
+}
+
+// Turns Sagepay's initial reponse to an array
+function _uc_sagepay_response_to_array($nvpstr) {
+  $response = split(chr(10), $nvpstr);
+  $output = array();
+  for ($i=0; $i<count($response); $i++) {
+    $splitAt = strpos($response[$i], "=");
+    $output[trim(drupal_substr($response[$i], 0, $splitAt))] = trim(drupal_substr($response[$i], ($splitAt+1)));
+  }
+  return $output;
+}
+
+/**
+ * Get a description string suitable for passing to Sagepay
+ */
+function _uc_sagepay_make_order_description($order) {
+  
+  $site_name = variable_get('site_name', 'Drupal');
+  $date_time = format_date(time(), 'medium');
+  $description = t('Purchase from @site_name on @date_time.', array('@site_name' => $site_name, '@date_time' => $date_time));
+  $description = drupal_substr($description, 0, 100);
+  
+  return $description;
+}
+
+/**
+ * Create a description of the user's shopping basket that is in the correct
+ * format for submission to Sagepay
+ */
+function _uc_sagepay_make_order_basket($order) {
+
+  $basket = '';
+  $break = ":";
+  $no_lines = 0;
+  
+  foreach ($order->products as $product) {    
+    $basket .= $break . $product->title;
+    $basket .= $break . $product->qty;
+    $basket .= $break . number_format($product->price, 2, '.', '');
+    $basket .= $break . '---';
+    $basket .= $break . number_format($product->price, 2, '.', '');
+    $basket .= $break . number_format(($product->qty * $product->price), 2, '.', '');
+    $no_lines++;
+  }
+  
+  return $no_lines . $basket;
+  
+}

@@ -1,0 +1,149 @@
+<?php
+
+/**
+ * Implementation of hook_requirements().
+ */
+function uc_sagepay_requirements($phase) {
+  $requirements = array();
+  
+  switch ($phase) {
+      
+    case 'runtime':
+        // Raise warning if no vendorname has been supplied yet
+        if ((variable_get('uc_sagepay_vendor_name', NULL)) == NULL) {
+          $requirements['uc_sagepay_vendorname'] = array(
+            'title' => t('Sagepay Server vendorname'),
+            'description' => t('You need to provide a Sagepay vendorname. Please enter one on the <a href="@url">Payment Methods settings page</a>.', array('@url' => url('admin/store/settings/payment/edit/methods'))),
+            'severity' => REQUIREMENT_ERROR,
+            'value' => t('Not configured'),
+          );
+        }
+      break;
+  }
+  
+  return $requirements;
+  
+}
+
+/**
+ * Implementation of hook_schema().
+ */
+function uc_sagepay_schema() {
+  $schema = array();
+
+  $schema['uc_sagepay_transactions'] = array(
+    'description' => 'Logs Sagepay Server Notifications.',
+    'fields' => array(
+      'order_id' => array(
+        'description' => 'The order ID.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'vendor_transaction_code' => array(
+        'description' => 'The unique transaction code sent to Sagepay (VendorTxCode).',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'uc_sagepay_transaction_id' => array(
+        'description' => 'The transaction ID from Sagepay (VPSTxId).',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'status' => array(
+        'description' => 'The notification status from Sagepay (Status).',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'status_detail' => array(
+        'description' => 'The detailed status message from Sagepay (StatusDetail).',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'security_key' => array(
+        'description' => 'The security key from Sagepay (SecurityKey).',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'received' => array(
+        'description' => 'The timestamp that the notification was received at.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'indexes' => array(
+      'order_id' => array('order_id'),
+      'transaction_id' => array('vendor_transaction_code')
+    ),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implementation of hook_install().
+ */
+function uc_sagepay_install() {
+  $ret = array();
+  // Check if we are migrating from uc_sagepaygoserver
+  if (db_table_exists('uc_sagepaygoserver_transactions')) {
+    // Rename uc_sagepaygoserver_transactions.uc_sagepaygoserver_transaction_id to uc_sagepaygoserver_transactions.uc_sagepay_transaction_id
+    $field_spec = array(
+      'description' => 'The transaction ID from Sagepay.',
+      'type' => 'varchar',
+      'length' => 255,
+      'not null' => TRUE,
+      'default' => '',
+    );
+    db_change_field($ret, 'uc_sagepaygoserver_transactions', 'uc_sagepaygoserver_transaction_id', 'uc_sagepay_transaction_id', $field_spec);
+    // Rename uc_sagepaygoserver_transactions table to uc_sagepay_transactions
+    db_rename_table($ret, 'uc_sagepaygoserver_transactions', 'uc_sagepay_transactions');
+    // Remove uc_order_statuses uc_sagepaygoserver_pending_reg and uc_sagepaygoserver_pending_result
+    db_query("DELETE FROM {uc_order_statuses} WHERE order_status_id IN ('uc_sagepaygoserver_pending_reg', 'uc_sagepaygoserver_pending_result')");
+    // Get configuration variables: uc_sagepaygoserver_mode, uc_sagepaygoserver_vendor_name, uc_sagepaygoserver_debug_notifications
+    variable_set('uc_sagepay_mode', variable_get('uc_sagepaygoserver_mode', 0));
+    variable_set('uc_sagepay_vendor_name', variable_get('uc_sagepaygoserver_vendor_name', NULL));
+    variable_set('uc_sagepay_debug_notifications', variable_get('uc_sagepaygoserver_debug_notifications', FALSE));
+  }
+  // Otherwise install schema as usual
+  else {
+    drupal_install_schema('uc_sagepay');
+  }
+  // Insert order status values in both cases
+  $t = get_t();
+  db_query("INSERT INTO {uc_order_statuses} (order_status_id, title, state, weight, locked) VALUES ('uc_sagepay_pending_reg', '" . $t('Pending Sagepay Registration Notification') . "', 'in_checkout', 0, 1);");
+  db_query("INSERT INTO {uc_order_statuses} (order_status_id, title, state, weight, locked) VALUES ('uc_sagepay_pending_result', '" . $t('Pending Sagepay Transaction Results') . "', 'in_checkout', 10, 1);");
+  return $ret;
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function uc_sagepay_uninstall() {
+  drupal_uninstall_schema('uc_sagepay');
+  db_query("DELETE FROM {variable} WHERE name IN ('uc_sagepay_mode', 'uc_sagepay_vendor_name', 'uc_sagepay_debug_notifications')");
+  db_query("DELETE FROM {uc_order_statuses} WHERE order_status_id IN ('uc_sagepay_pending_reg', 'uc_sagepay_pending_result')");
+}
+
+/**
+ * Implementation of hook_update().
+ */
+function uc_sagepay_update_6101() {
+  $ret = array();
+  // Remove transaction_auth_no from uc_sagepay_transactions
+  db_drop_field($ret, 'uc_sagepay_transactions', 'transaction_auth_no');
+  return $ret;
+}
